@@ -16,7 +16,14 @@
  * into a watertight wall, reusing prop/sweep.js's proven `sweep` and its three
  * line-settling passes verbatim.
  */
-import { PROP, PART_BAND, sweep, sweepBetween, floorLine, moldLine, contourTop, lowerSag, settleTop, emitTines, tineStepFor } from './prop.js';
+import { PROP, PART_BAND, sweep, sweepBetween, sweepSquat, floorLine, moldLine, contourTop, lowerSag, settleTop, emitTines, tineStepFor } from './prop.js';
+
+/**
+ * A hand-drawn wall may be much shorter than an auto wall (PROP.minSpan, 7 mm): the user
+ * is pointing at one small overhang -- a cleat, a fingertip, a chin -- that no auto
+ * wall reaches. 2 mm still gives the three stations a sweep needs (local issue 011).
+ */
+export const DRAW_MIN_LEN = 2;
 
 /**
  * Every surface height directly above (x, y), as a list.
@@ -42,6 +49,42 @@ function surfaceZsAt(tris, x, y) {
     zs.push(l1 * az + l2 * bz + l3 * cz);
   }
   return zs;
+}
+
+/**
+ * Is (x, y, z) inside the part? Odd number of surfaces below it in that column. The
+ * squat fallback has no clearance probe of its own (Auto's stationIsClear needs the
+ * topology), and at 0.6 mm of headroom a line on an UPWARD face reads that face as its
+ * floor -- so it checks the solid directly.
+ */
+function solidAt(tris, x, y, z) {
+  // a column through a shared edge hits both triangles: one surface, counted once
+  const zs = surfaceZsAt(tris, x, y).filter((zz) => zz < z).sort((p, q) => p - q);
+  let n = 0;
+  for (let i = 0; i < zs.length; i++) if (i === 0 || zs[i] - zs[i - 1] > 1e-5) n++;
+  return n % 2 === 1;
+}
+
+/** Each station sits under a DOWN-facing surface: air just below it and part within
+ * half a mm above (the settle passes leave a top a little under the underside). */
+function underAnOverhang(line, tris) {
+  return line.every((p) => !solidAt(tris, p[0], p[1], p[2] - 0.02)
+    && [0.02, 0.1, 0.25, 0.5].some((d) => solidAt(tris, p[0], p[1], p[2] + d)));
+}
+
+/** Points across a wall at each station, `w` either side of its centre line, at height z(i). */
+function acrossClear(line, tris, w, z) {
+  for (let i = 0; i < line.length; i++) {
+    const a = line[Math.max(0, i - 1)], b = line[Math.min(line.length - 1, i + 1)];
+    let rx = b[0] - a[0], ry = b[1] - a[1];
+    const rn = Math.hypot(rx, ry);
+    if (rn < 1e-9) return false;
+    rx /= rn; ry /= rn;
+    for (const o of [-w, -w / 2, 0, w / 2, w]) {
+      if (solidAt(tris, line[i][0] + ry * o, line[i][1] - rx * o, z(i))) return false;
+    }
+  }
+  return true;
 }
 
 /**
@@ -87,8 +130,8 @@ export function drawnLine(a, b, tris, step = PROP.stationStep, band = Infinity) 
 export function drawnWall(a, b, tris, zBed = 0, opts = {}) {
   const dx = b[0] - a[0], dy = b[1] - a[1];
   const len = Math.hypot(dx, dy);
-  if (len < PROP.minSpan) {
-    return { ok: false, reason: `wall too short — ${len.toFixed(0)}mm, needs ${PROP.minSpan}mm` };
+  if (len < DRAW_MIN_LEN) {
+    return { ok: false, reason: `wall too short — ${len.toFixed(1)}mm, needs ${DRAW_MIN_LEN}mm` };
   }
   const out = [];
   // A drawn wall grips the part with the same tine comb the auto fins use, when
@@ -96,9 +139,11 @@ export function drawnWall(a, b, tris, zBed = 0, opts = {}) {
   // it only runs when the caller passes topo/rot/offset -- the live preview omits
   // them and stays a plain wall for speed. `topLine` is the wall's surface-z contact
   // line (emitTines subtracts the gap itself).
-  const withTines = (line) => opts.tines && opts.topo
+  // (`minTop`: a squat plate wall's base is its thin brim, so its tines start from
+  // squatBrimH, as Auto's squat walls do -- the flange default would skip every one)
+  const withTines = (line, minTop = undefined) => opts.tines && opts.topo
     ? emitTines(line, tris, opts.topo, opts.rot, opts.offset, out,
-                tineStepFor(opts.tineDensity), undefined, opts.layerHeight ?? PROP.tineH)
+                tineStepFor(opts.tineDensity), minTop, opts.layerHeight ?? PROP.tineH)
     : 0;
   // PART-ATTACHED first: if solid part sits below the overhang, the support
   // stands on THAT, not the plate. Probe with a BANDED top contour so the
@@ -143,6 +188,17 @@ export function drawnWall(a, b, tris, zBed = 0, opts = {}) {
   // The clicked endpoints' heights are exactly "what the user pointed at", so a
   // high clickTop with a failed sweep is the unreachable case, not a low line.
   if (!sweep(line, zBed, out)) {
+    // Neither full-height wall fits. Before refusing, the two SQUAT walls a user
+    // drawing by hand can still want (local issue 011) -- tried only now, so every
+    // drawn wall that built before builds exactly the same:
+    //   - on the part, with as little as minHeightSquat headroom (a hand just over a thigh);
+    //   - on the plate, its low stations a brimmed squat stem, the tall ones the full wall.
+    const squat = squatWall(topPA, line, tris, zBed);
+    if (squat) {
+      out.push(...squat.tris);
+      const tines = withTines(squat.top, squat.partAttached ? undefined : PROP.squatBrimH);
+      return { ok: true, tris: out, length: len, height: squat.height, partAttached: squat.partAttached, squat: true, tines };
+    }
     const clickTop = Math.min(a[2], b[2]) - zBed;
     if (clickTop >= PROP.minHeight + PROP.gap) {
       return { ok: false, reason: 'this overhang sits above another part of the '
@@ -155,4 +211,66 @@ export function drawnWall(a, b, tris, zBed = 0, opts = {}) {
   for (const p of line) height = Math.max(height, p[2] - PROP.gap - zBed);
   const tines = withTines(line);
   return { ok: true, tris: out, length: len, height, tines };
+}
+
+/**
+ * The squat fallback for a drawn line no full-height wall fits: `{ tris, top, height,
+ * partAttached }` or null. Part first (sweepBetween down to minHeightSquat of headroom --
+ * in practice just over 1 mm of room, since floorLine skips surfaces within its 1 mm margin),
+ * then the plate: stations from minHeightSquat to minHeight get a brimmed squat stem
+ * (sweepSquat, what Auto builds near the bed), taller runs keep the flanged wall.
+ * A station under minHeightSquat still refuses the whole line.
+ */
+function squatWall(topPA, line, tris, zBed) {
+  if (topPA && topPA.length >= PROP.minStations && underAnOverhang(topPA, tris)) {
+    const floor = floorLine(topPA, tris);
+    // the wall's middle, between its floor and its top, is air (on an upward slope
+    // the "floor" is the slope itself and this is solid)
+    const midClear = acrossClear(topPA, tris, PROP.th / 2,
+      (i) => (topPA[i][2] - PROP.gap + floor[i][2] + PROP.footGap) / 2);
+    if (midClear && floor.some((p) => p[2] > PROP.gap + 0.5)) {
+      const mold = moldLine(topPA, tris);
+      const t = [];
+      if (mold && sweepBetween(mold.top, mold.floor, t, PROP.minHeightSquat)) {
+        let height = 0;
+        for (let i = 0; i < topPA.length; i++) height = Math.max(height, topPA[i][2] - PROP.gap - floor[i][2]);
+        return { tris: t, top: topPA, height, partAttached: true };
+      }
+    }
+  }
+  const h = line.map((p) => p[2] - PROP.gap - zBed);
+  if (h.some((v) => v < PROP.minHeightSquat)) return null;
+  // a plate wall stands only where the way down is clear: part under a station (too
+  // close for the squat wall on it above) would put this one straight through it
+  if (floorLine(line, tris).some((p) => p[2] > PROP.gap + 0.5)) return null;
+  // ...and only under a real overhang, with room for the whole brim (squatBrimW either
+  // side, wider than the stem floorLine looked under) and the stem beside the line
+  if (!underAnOverhang(line, tris)) return null;
+  // (probed at the brim's TOP plus the gap: under an underside that dips beside the
+  // line, mid-height passed while the brim's top corner sat in the part -- torus)
+  if (!acrossClear(line, tris, PROP.squatBrimW, () => zBed + PROP.squatBrimH + PROP.gap)) return null;
+  if (!acrossClear(line, tris, PROP.th / 2, (i) => zBed + (line[i][2] - PROP.gap - zBed) / 2)) return null;
+  // runs of tall (full wall) and low (squat) stations; a tall run under two stations
+  // can't sweep, so it goes squat with its neighbours
+  const tall = h.map((v) => v >= PROP.minHeight);
+  for (let i = 0; i < tall.length; i++) {
+    if (tall[i] && !tall[i - 1] && !tall[i + 1]) tall[i] = false;
+  }
+  const t = [];
+  let i = 0;
+  while (i < line.length) {
+    let j = i;
+    while (j + 1 < line.length && tall[j + 1] === tall[i]) j++;
+    if (tall[i]) {
+      if (!sweep(line.slice(i, j + 1), zBed, t)) return null;
+    } else {
+      // a squat run reaches TWO stations into each tall neighbour: the tall sweep ends at
+      // its own first/last station, so one would only meet it face to face -- the pieces
+      // must overlap, never sit flush (Fusion's weld). sweepSquat takes any h >= 0.6.
+      const seg = line.slice(Math.max(0, i - 2), Math.min(line.length, j + 3));
+      if (seg.length < 2 || !sweepSquat(seg, zBed, t)) return null;
+    }
+    i = j + 1;
+  }
+  return { tris: t, top: line, height: Math.max(...h), partAttached: false };
 }
